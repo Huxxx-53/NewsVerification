@@ -1,0 +1,7 @@
+flet==0.24.1
+streamlit>=1.37,<2
+anthropic==0.34.2
+duckduckgo-search==6.2.13
+# duckduckgo-search 6.2.13 uses browser profiles removed from newer primp releases.
+primp==0.6.3
+python-dotenv==1.0.1
