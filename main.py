@@ -15,7 +15,7 @@ import threading
 import flet as ft
 from dotenv import load_dotenv
 
-from controllers import verification_controller as controller
+import verification_controller as controller
 from views.home_view import build_home_view
 from views.result_view import build_result_view
 from views.history_view import build_history_view
