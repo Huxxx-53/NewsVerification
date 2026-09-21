@@ -1,104 +1,158 @@
+"""News Verification App - Streamlit user interface and entry point.
+
+Run with:  streamlit run main.py
 """
-main.py
+import os
 
-Flet application entrypoint. Responsible for:
-- Setting up routing between Home / Result / History views
-- Running the (potentially slow) verification pipeline on a background
-  thread so the UI doesn't freeze
-- Wiring view callbacks to controllers/verification_controller.py
-
-No search or AI logic lives here - see controllers/verification_controller.py.
-"""
-
-import threading
-
-import flet as ft
+import streamlit as st
 from dotenv import load_dotenv
 
-import verification_controller as controller
-from views.home_view import build_home_view
-from views.result_view import build_result_view
-from views.history_view import build_history_view
+load_dotenv()  # reads .env locally; on Streamlit Cloud, secrets are provided as env vars
 
-load_dotenv()  # reads ANTHROPIC_API_KEY / ANTHROPIC_MODEL from .env
+from models.verification_result import (  # noqa: E402
+    VERDICT_DISPUTED,
+    VERDICT_SUPPORTED,
+    VerificationResult,
+)
+from services.ai_service import AIService  # noqa: E402
+from services.search_service import SearchError, get_search_provider  # noqa: E402
+from services.verification_service import VerificationService  # noqa: E402
+from utils.helpers import escape_md, markdown_safe_url, truncate, validate_claim  # noqa: E402
+
+st.set_page_config(page_title="News Verification App", page_icon="🔎", layout="centered")
+
+EXAMPLES = {
+    "Example: coffee": "Scientists have discovered that drinking coffee completely prevents heart disease.",
+    "Example: 5G": "5G mobile networks spread the coronavirus.",
+    "Example: moon": "NASA landed astronauts on the Moon in 1969.",
+}
 
 
-def main(page: ft.Page):
-    page.title = "News Verification App"
-    page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = ft.colors.GREY_100
-    page.padding = 0
-    page.scroll = ft.ScrollMode.AUTO
+# ----------------------------------------------------------------- callbacks
+def set_example(text: str) -> None:
+    st.session_state["claim_input"] = text
+    st.session_state["result"] = None
 
-    # Holds the record most recently viewed, so /result can be rebuilt
-    # on refresh/back-navigation without re-running verification.
-    state = {"current_record": None}
 
-    def go_home(error_message: str = "", prefill_claim: str = ""):
-        page.views.clear()
-        page.views.append(
-            build_home_view(
-                page,
-                claims_checked=controller.get_claims_checked_count(),
-                on_verify=start_verification,
-                on_view_history=go_history,
-                error_message=error_message,
-                prefill_claim=prefill_claim,
-            )
+def reset() -> None:
+    st.session_state["claim_input"] = ""
+    st.session_state["result"] = None
+
+
+# ----------------------------------------------------------------- rendering
+def render_sources(result: VerificationResult) -> None:
+    st.subheader("Sources")
+    st.caption(
+        "These are the pages the search returned. They are listed with better-known source "
+        "types first, but that does not guarantee they are correct - please read them yourself."
+    )
+    for i, s in enumerate(result.sources, start=1):
+        with st.container(border=True):
+            st.markdown(f"**Source {i}: {escape_md(s.source_name)}**  \n*{escape_md(s.source_type)}*")
+            st.markdown(f"**{escape_md(s.title)}**")
+            st.caption(f"Date: {s.published_date or 'not available'}")
+            st.write(escape_md(truncate(s.snippet, 300)))
+            url = markdown_safe_url(s.url)
+            st.markdown(f"[{escape_md(s.url)}]({url})")
+
+
+def render_result(result: VerificationResult) -> None:
+    st.divider()
+
+    if result.error:
+        st.error(result.error)
+        if result.sources:
+            st.info("Sources were found before the problem occurred, so you can still read them.")
+            render_sources(result)
+        return
+
+    st.markdown("#### VERDICT")
+    label = f"**{result.verdict}**"
+    if result.verdict == VERDICT_SUPPORTED:
+        st.success(label, icon="✅")
+    elif result.verdict == VERDICT_DISPUTED:
+        st.error(label, icon="⚠️")
+    else:
+        st.warning(label, icon="❓")
+    if result.confidence is not None and result.sources:
+        st.caption(
+            f"AI self-reported confidence: {result.confidence:.0%}. "
+            "This is the model's own estimate, not a measured probability."
         )
-        page.update()
 
-    def go_result(record: dict):
-        state["current_record"] = record
-        page.views.clear()
-        page.views.append(build_result_view(page, record, on_back=lambda: go_home()))
-        page.update()
+    st.subheader("Explanation")
+    st.write(escape_md(result.summary))
+    if result.reasoning:
+        st.write(escape_md(result.reasoning))
 
-    def go_history():
-        page.views.clear()
-        page.views.append(
-            build_history_view(
-                page,
-                history=controller.get_history(),
-                on_open_item=open_history_item,
-                on_back=lambda: go_home(),
-                on_clear_all=clear_all_history,
-            )
+    if result.evidence:
+        st.subheader("Evidence")
+        st.caption("What the retrieved sources say (the interpretation is in the explanation above).")
+        for item in result.evidence:
+            source = result.sources[item.source_index - 1]
+            st.markdown(f"- {escape_md(item.text)}  \n  *Source {item.source_index}: {escape_md(source.source_name)}*")
+
+    if result.sources:
+        render_sources(result)
+
+    st.info(
+        "This result was produced by AI from the sources above. It is **not absolute truth** - "
+        "open the original sources and judge for yourself."
+    )
+    st.button("Verify another claim", on_click=reset)
+
+
+# ---------------------------------------------------------------------- main
+def build_service() -> VerificationService:
+    return VerificationService(search_provider=get_search_provider(), ai_service=AIService())
+
+
+def main() -> None:
+    st.session_state.setdefault("claim_input", "")
+    st.session_state.setdefault("result", None)
+
+    st.title("News Verification App")
+    st.write("Check online claims using AI-assisted evidence retrieval.")
+
+    if not os.getenv("SEARCH_API_KEY") or not os.getenv("AI_API_KEY"):
+        st.warning(
+            "API keys are not fully configured. Copy `.env.example` to `.env` and add "
+            "`SEARCH_API_KEY` and `AI_API_KEY` (see README)."
         )
-        page.update()
 
-    def open_history_item(record_id: int):
-        record = controller.get_result(record_id)
-        if record:
-            go_result(record)
+    st.text_area(
+        "Enter a claim or headline:",
+        key="claim_input",
+        height=150,
+        placeholder="Paste a headline, social-media claim, or short statement here...",
+    )
+
+    cols = st.columns(len(EXAMPLES))
+    for col, (name, text) in zip(cols, EXAMPLES.items()):
+        col.button(name, on_click=set_example, args=(text,), use_container_width=True)
+
+    if st.button("Verify Claim", type="primary"):
+        _, error = validate_claim(st.session_state["claim_input"])
+        if error:
+            st.session_state["result"] = None
+            st.error(error)
         else:
-            go_history()
+            with st.status("Verifying...", expanded=True) as status_box:
+                try:
+                    service = build_service()
+                    result = service.verify(
+                        st.session_state["claim_input"], on_status=lambda msg: st.write(msg)
+                    )
+                except SearchError as exc:  # e.g. unknown SEARCH_PROVIDER
+                    result = VerificationResult(claim=st.session_state["claim_input"], error=str(exc))
+                if result.error:
+                    status_box.update(label="Could not finish verification", state="error", expanded=False)
+                else:
+                    status_box.update(label="Verification complete", state="complete", expanded=False)
+            st.session_state["result"] = result
 
-    def clear_all_history():
-        from models import history_model
-        history_model.clear_history()
-        go_history()
-
-    def start_verification(claim_text: str):
-        """
-        Called from the Home view's Verify button. Runs the pipeline on a
-        background thread so typing/scrolling elsewhere isn't blocked,
-        then routes to /result on success or back to home with an error.
-        """
-
-        def worker():
-            result = controller.run_verification(claim_text)
-            if result["ok"]:
-                go_result(result["record"])
-            else:
-                # Keep the user's claim text so they don't have to retype it.
-                go_home(error_message=result["message"], prefill_claim=claim_text)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    # Initial route.
-    go_home()
+    if st.session_state["result"] is not None:
+        render_result(st.session_state["result"])
 
 
-if __name__ == "__main__":
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER)
+main()
